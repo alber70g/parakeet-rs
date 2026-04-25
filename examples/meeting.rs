@@ -187,7 +187,7 @@ fn to_mono(audio: Vec<f32>, channels: u16) -> Vec<f32> {
 
 /// Transcribe a mono 16kHz audio slice with TDT, returning sentence-level segments.
 #[cfg(feature = "sortformer")]
-fn transcribe_chunk(
+fn transcribe_chunk_inner(
     model: &mut ParakeetTDT,
     chunk: &[f32],
     time_offset: f32,
@@ -237,12 +237,16 @@ fn build_exec_config(use_cuda: bool) -> ExecutionConfig {
     #[cfg(feature = "cuda")]
     if use_cuda {
         println!("    Using CUDA execution provider");
-        return ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda);
+        return ExecutionConfig::new()
+            .with_execution_provider(ExecutionProvider::Cuda)
+            .with_intra_threads(1);
     }
     if use_cuda {
         println!("    WARNING: --cuda passed but binary was not built with cuda feature; falling back to CPU");
     }
-    ExecutionConfig::new()
+    // For CPU: use all available threads for ONNX intra-op parallelism
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    ExecutionConfig::new().with_intra_threads(threads)
 }
 
 /// Write the full transcript to a text file.
@@ -322,35 +326,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             duration / 60.0
         );
 
-        // ── 2. Speaker diarization (full audio, streaming) ───────────────────────
-        println!("[2/4] Speaker diarization (Sortformer v2)…");
-        let diar_start = Instant::now();
-
         let exec_config = build_exec_config(args.use_cuda);
 
-        let mut sortformer = Sortformer::with_config(
-            &args.sortformer_model,
-            Some(exec_config.clone()),
-            DiarizationConfig::callhome(),
-        )?;
+        // ── 2+4. Diarization and transcription run in parallel threads ───────────
+        // Sortformer is stateful-sequential internally but independent of TDT,
+        // so we can overlap both on separate CPU cores.
+        println!("[2+4] Diarization (Sortformer) + Transcription (TDT) in parallel…");
+        let parallel_start = Instant::now();
+
+        let audio_for_diar = audio.clone();
+        let audio_for_tdt = audio.clone();
+        let sortformer_model = args.sortformer_model.clone();
+        let tdt_dir = args.tdt_dir.clone();
+        let use_cuda_diar = args.use_cuda;
+        let use_cuda_tdt = args.use_cuda;
+        let identify_mode = args.identify_mode;
+        drop(exec_config); // rebuilt inside each thread
+
+        type ThreadResult<T> = std::result::Result<T, String>;
+
+        let diar_handle = std::thread::spawn(move || -> ThreadResult<_> {
+            let diar_start = Instant::now();
+            let mut sortformer = Sortformer::with_config(
+                &sortformer_model,
+                Some(build_exec_config(use_cuda_diar)),
+                DiarizationConfig::callhome(),
+            ).map_err(|e| e.to_string())?;
+            let chunk_len = sortformer.chunk_len;
+            let right_context = sortformer.right_context;
+            let latency = sortformer.latency();
+            let segs = sortformer.diarize(audio_for_diar, 16_000, 1).map_err(|e| e.to_string())?;
+            let elapsed = diar_start.elapsed().as_secs_f32();
+            Ok((segs, elapsed, chunk_len, right_context, latency))
+        });
+
+        // In identify mode we only need diarization — skip TDT entirely.
+        let tdt_handle = if !identify_mode {
+            Some(std::thread::spawn(move || -> ThreadResult<_> {
+                let tdt_start = Instant::now();
+                let mut tdt = ParakeetTDT::from_pretrained(&tdt_dir, Some(build_exec_config(use_cuda_tdt)))
+                    .map_err(|e| e.to_string())?;
+                let total_samples = audio_for_tdt.len();
+                let mut timed_sentences: Vec<(f32, f32, String)> = Vec::new();
+                let mut offset = 0usize;
+                while offset < total_samples {
+                    let end = (offset + TDT_CHUNK_SAMPLES).min(total_samples);
+                    let chunk = &audio_for_tdt[offset..end];
+                    let time_offset = offset as f32 / 16_000.0;
+                    let mut sents = transcribe_chunk_inner(&mut tdt, chunk, time_offset)
+                        .map_err(|e| e.to_string())?;
+                    timed_sentences.append(&mut sents);
+                    offset = end;
+                }
+                let elapsed = tdt_start.elapsed().as_secs_f32();
+                Ok((timed_sentences, elapsed))
+            }))
+        } else {
+            None
+        };
+
+        let (speaker_segments, diar_elapsed, chunk_len, right_context, latency) =
+            diar_handle.join().map_err(|_| "diarization thread panicked")?
+                .map_err(|e| e)?;
 
         println!(
-            "    chunk_len={}, right_context={}, latency={:.2}s",
-            sortformer.chunk_len,
-            sortformer.right_context,
-            sortformer.latency()
+            "    Sortformer: chunk_len={}, right_context={}, latency={:.2}s",
+            chunk_len, right_context, latency
         );
-
-        // Feed entire audio at once – Sortformer handles long files natively.
-        let speaker_segments = sortformer.diarize(audio.clone(), 16_000, 1)?;
-
         println!(
-            "    {} speaker segments in {:.1}s\n",
-            speaker_segments.len(),
-            diar_start.elapsed().as_secs_f32()
+            "    {} speaker segments in {:.1}s",
+            speaker_segments.len(), diar_elapsed
         );
 
-        // Collect unique speaker IDs sorted for deterministic output.
+        // Collect unique speaker IDs.
         let mut unique_speakers: Vec<usize> = {
             let mut ids: Vec<usize> = speaker_segments.iter().map(|s| s.speaker_id).collect();
             ids.sort_unstable();
@@ -371,30 +419,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         speaker_names.insert(id, v);
                     }
                 }
-                println!(
-                    "[3/4] Speaker names loaded from {}: {:?}\n",
-                    sf, speaker_names
-                );
-            } else {
-                println!("[3/4] speakers.json not found – will use Speaker N labels\n");
             }
-        } else {
-            println!("[3/4] No --speakers file given – will use Speaker N labels\n");
         }
 
         // ── 3b. Identify mode: extract samples + print identification windows ────
         if args.identify_mode {
-            println!("=== Speaker Identification Mode ===");
+            // TDT thread was not spawned in identify mode — just use diarization result.
+            println!("\n=== Speaker Identification Mode ===");
             println!("Extracting a sample clip per speaker for manual identification.\n");
 
-            // For each speaker find the first long-enough continuous segment.
             for &spk in &unique_speakers {
                 let name = speaker_names
                     .get(&spk)
                     .cloned()
                     .unwrap_or_else(|| format!("Speaker {}", spk));
 
-                // Find best segment: longest segment ≥ MIN_SPEAKER_SAMPLE_SECS
                 let best = speaker_segments
                     .iter()
                     .filter(|s| s.speaker_id == spk)
@@ -413,7 +452,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
 
-                    // Extract up to SPEAKER_SAMPLE_SECS
                     let sample_end_s = (seg_start_s + SPEAKER_SAMPLE_SECS).min(seg_end_s);
                     let start_idx = seg.start as usize;
                     let end_idx = (sample_end_s * 16_000.0) as usize;
@@ -424,8 +462,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     println!(
                         "  Speaker {} ({}):  [{} – {}]  → {}",
-                        spk,
-                        name,
+                        spk, name,
                         format_time(seg_start_s),
                         format_time(sample_end_s),
                         sample_path.display()
@@ -433,64 +470,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Write template speakers.json if it doesn't exist yet.
             if let Some(ref sf) = args.speakers_file {
                 if !std::path::Path::new(sf).exists() {
                     let template: HashMap<String, String> = unique_speakers
                         .iter()
                         .map(|id| (id.to_string(), format!("Speaker {}", id)))
                         .collect();
-                    let json = serde_json::to_string_pretty(&template)?;
-                    std::fs::write(sf, &json)?;
-                    println!(
-                        "\nTemplate speakers.json written to {}",
-                        sf
-                    );
+                    std::fs::write(sf, serde_json::to_string_pretty(&template)?)?;
+                    println!("\nTemplate speakers.json written to {}", sf);
                     println!("Edit it to assign real names, then re-run without --identify.");
                 }
-            } else {
-                println!("\nTip: re-run with --speakers speakers.json to save/load name mappings.");
             }
 
-            println!(
-                "\nTotal time: {:.1}s",
-                total_start.elapsed().as_secs_f32()
-            );
+            println!("\nTotal time: {:.1}s", total_start.elapsed().as_secs_f32());
             return Ok(());
         }
 
-        // ── 4. Transcription with TDT (chunked for long audio) ──────────────────
-        println!("[4/4] Transcribing with Parakeet-TDT (chunk size: 5 min)…");
-        let tdt_start = Instant::now();
-
-        let mut tdt = ParakeetTDT::from_pretrained(&args.tdt_dir, Some(exec_config))?;
-
-        let mut timed_sentences: Vec<(f32, f32, String)> = Vec::new();
-        let total_samples = audio.len();
-        let mut offset = 0usize;
-
-        while offset < total_samples {
-            let end = (offset + TDT_CHUNK_SAMPLES).min(total_samples);
-            let chunk = &audio[offset..end];
-            let time_offset = offset as f32 / 16_000.0;
-
-            let chunk_duration = chunk.len() as f32 / 16_000.0;
-            println!(
-                "    chunk [{} – {}] ({:.1}s)…",
-                format_time(time_offset),
-                format_time(time_offset + chunk_duration),
-                chunk_duration
-            );
-
-            let mut chunk_sentences = transcribe_chunk(&mut tdt, chunk, time_offset)?;
-            timed_sentences.append(&mut chunk_sentences);
-            offset = end;
-        }
+        // Join TDT thread (ran concurrently with diarization above).
+        let (timed_sentences, tdt_elapsed) = tdt_handle.unwrap()
+            .join().map_err(|_| "TDT thread panicked")?
+            .map_err(|e| e)?;
 
         println!(
-            "    {} sentences in {:.1}s\n",
-            timed_sentences.len(),
-            tdt_start.elapsed().as_secs_f32()
+            "    TDT: {} sentences in {:.1}s",
+            timed_sentences.len(), tdt_elapsed
+        );
+        println!(
+            "    Parallel wall time: {:.1}s\n",
+            parallel_start.elapsed().as_secs_f32()
         );
 
         // ── 5. Merge transcript + diarization ────────────────────────────────────
