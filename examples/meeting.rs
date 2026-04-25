@@ -67,7 +67,7 @@ use hound::{WavSpec, WavWriter};
 #[cfg(feature = "sortformer")]
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
 #[cfg(feature = "sortformer")]
-use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
+use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, TimestampMode, Transcriber};
 #[cfg(feature = "sortformer")]
 use std::collections::HashMap;
 #[cfg(feature = "sortformer")]
@@ -117,6 +117,7 @@ struct Args {
     output_file: Option<String>,
     identify_mode: bool,
     samples_dir: String,
+    use_cuda: bool,
 }
 
 #[cfg(feature = "sortformer")]
@@ -138,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
         output_file: None,
         identify_mode: false,
         samples_dir: "./speaker_samples".to_string(),
+        use_cuda: false,
     };
     let mut i = 2;
     while i < raw.len() {
@@ -148,6 +150,7 @@ fn parse_args() -> Result<Args, String> {
             "--output" => { i += 1; args.output_file = Some(raw[i].clone()); }
             "--identify" => { args.identify_mode = true; }
             "--samples-dir" => { i += 1; args.samples_dir = raw[i].clone(); }
+            "--cuda" => { args.use_cuda = true; }
             other => return Err(format!("Unknown argument: {}", other)),
         }
         i += 1;
@@ -226,6 +229,20 @@ fn save_speaker_sample(
     }
     writer.finalize()?;
     Ok(())
+}
+
+/// Build execution config — CUDA if requested and feature is enabled, else CPU.
+#[cfg(feature = "sortformer")]
+fn build_exec_config(use_cuda: bool) -> ExecutionConfig {
+    #[cfg(feature = "cuda")]
+    if use_cuda {
+        println!("    Using CUDA execution provider");
+        return ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda);
+    }
+    if use_cuda {
+        println!("    WARNING: --cuda passed but binary was not built with cuda feature; falling back to CPU");
+    }
+    ExecutionConfig::new()
 }
 
 /// Write the full transcript to a text file.
@@ -309,9 +326,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[2/4] Speaker diarization (Sortformer v2)…");
         let diar_start = Instant::now();
 
+        let exec_config = build_exec_config(args.use_cuda);
+
         let mut sortformer = Sortformer::with_config(
             &args.sortformer_model,
-            None,
+            Some(exec_config.clone()),
             DiarizationConfig::callhome(),
         )?;
 
@@ -444,7 +463,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[4/4] Transcribing with Parakeet-TDT (chunk size: 5 min)…");
         let tdt_start = Instant::now();
 
-        let mut tdt = ParakeetTDT::from_pretrained(&args.tdt_dir, None)?;
+        let mut tdt = ParakeetTDT::from_pretrained(&args.tdt_dir, Some(exec_config))?;
 
         let mut timed_sentences: Vec<(f32, f32, String)> = Vec::new();
         let total_samples = audio.len();
