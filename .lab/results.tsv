@@ -1,0 +1,2 @@
+experiment	branch	parent	commit	metric_s	status	duration_s	description
+0	research/meeting-speed	none	4bfadd6	>300	crash(timeout)	300	CPU baseline — Sortformer alone exceeds 5min budget

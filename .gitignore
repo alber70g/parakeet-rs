@@ -11,4 +11,5 @@ DS_Store
 *.txt
 *.onnx.data
 *.onnx_data_*
-*.model
+*.model.lab/
+run.log
