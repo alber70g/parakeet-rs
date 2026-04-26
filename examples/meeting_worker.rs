@@ -483,7 +483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(sortformer_config(args.use_cuda)),
             DiarizationConfig::callhome(),
         )?;
-        sf.chunk_len = 80; sf.fifo_len = 80; sf.spkcache_len = 120;
+        sf.chunk_len = 80; sf.fifo_len = 80; sf.spkcache_len = 40;
 
         if args.use_cuda {
             std::thread::sleep(std::time::Duration::from_millis(500));
