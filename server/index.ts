@@ -280,17 +280,26 @@ async function handleUpload(req: Request): Promise<Response> {
   }
 
   const file = form.get("audio");
-  if (!file || typeof file === "string") return jsonError('"audio" file field required', 400);
+  if (!file) return jsonError('"audio" file field required', 400);
 
   if (!worker.isReady()) return jsonError("Worker not ready yet", 503);
 
-  // Read uploaded bytes and derive a stable hash
-  const buf = await (file as File).arrayBuffer();
+  // Accept File/Blob (binary upload) or a string path
+  let buf: ArrayBuffer;
+  let filename: string;
+  if (typeof file === "string") {
+    // Client sent a path string in a form field — treat as local path
+    buf = await Bun.file(file).arrayBuffer();
+    filename = file.split(/[\\/]/).pop() ?? "audio";
+  } else {
+    buf = await (file as File).arrayBuffer();
+    filename = (file as File).name || "audio";
+  }
   const hash = await bytesHash(buf);
 
   // Write original upload to a stable path (so ffmpeg can read it by format/extension)
   await mkdir(WAV_CACHE_DIR, { recursive: true });
-  const ext = ((file as File).name.match(/\.[^.]+$/) ?? [".bin"])[0].toLowerCase();
+  const ext = (filename.match(/\.[^.]+$/) ?? [".bin"])[0].toLowerCase();
   const uploadPath = join(WAV_CACHE_DIR, `${hash}${ext}`);
   const uploadExists = await Bun.file(uploadPath).exists();
   if (!uploadExists) await Bun.write(uploadPath, buf);
@@ -298,7 +307,7 @@ async function handleUpload(req: Request): Promise<Response> {
   let wavPath: string;
   try {
     wavPath = await ensureWav(uploadPath, hash);
-    console.log(`[ffmpeg] upload(${(file as File).name}) → ${wavPath}`);
+    console.log(`[ffmpeg] upload(${filename}) → ${wavPath}`);
   } catch (e) {
     return jsonError(`Audio conversion failed: ${(e as Error).message}`, 422);
   }
@@ -320,9 +329,12 @@ async function handleUpload(req: Request): Promise<Response> {
 }
 
 async function runWorker(workerReq: Record<string, unknown>, hash: string): Promise<Response> {
-  // Full transcript cache — skip worker entirely on hit (not for identify: clips must be regenerated if missing)
   const isIdentify = workerReq.identify === true;
-  if (!isIdentify) {
+  const hasSpeakers = typeof workerReq.speakers === "string";
+
+  // Transcript cache only applies to plain transcription (no identify, no custom speaker names)
+  const useCache = !isIdentify && !hasSpeakers;
+  if (useCache) {
     const cached = await readTranscriptCache(hash);
     if (cached) {
       cached.transcript_source = "cache";
@@ -350,8 +362,10 @@ async function runWorker(workerReq: Record<string, unknown>, hash: string): Prom
   parsed.transcript = result.transcript.join("\n");
   parsed.transcript_source = "live";
 
-  // Persist for future requests
-  writeTranscriptCache(hash, parsed).catch(e => console.error("[transcript] cache write failed:", e));
+  // Only cache plain anonymous transcripts — named/identify runs are not cached
+  if (useCache) {
+    writeTranscriptCache(hash, parsed).catch(e => console.error("[transcript] cache write failed:", e));
+  }
 
   return new Response(JSON.stringify(parsed), { status: 200, headers: { "content-type": "application/json" } });
 }
