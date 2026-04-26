@@ -290,15 +290,12 @@ impl Worker {
         let audio_for_tdt = audio.to_vec();
         let use_cuda = self.use_cuda;
 
-        // stagger to avoid CUDA JIT collision
+        // No stagger needed — CUDA already warm from model load at startup.
         let diar_handle = std::thread::spawn(move || -> ThreadResult<(Vec<SpeakerSegment>, Sortformer)> {
             let segs = sf.diarize(audio_for_diar, 16_000, 1).map_err(|e| e.to_string())?;
             Ok((segs, sf))
         });
-
-        if use_cuda {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
+        let _ = use_cuda;
 
         let tdt_handle = std::thread::spawn(move || -> ThreadResult<(Vec<(f32,f32,String)>, ParakeetTDT)> {
             let total = audio_for_tdt.len();
