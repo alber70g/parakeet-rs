@@ -352,6 +352,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(build_exec_config(use_cuda_diar)),
                 DiarizationConfig::callhome(),
             ).map_err(|e| e.to_string())?;
+            // Halve the streaming params to reduce attention cost per chunk.
+            // The ONNX graph uses dynamic axes so these are valid at runtime.
+            // Trade-off: slightly lower diarization quality but much faster on CPU.
+            sortformer.chunk_len = 62;
+            sortformer.fifo_len = 62;
+            sortformer.spkcache_len = 94;
             let chunk_len = sortformer.chunk_len;
             let right_context = sortformer.right_context;
             let latency = sortformer.latency();
