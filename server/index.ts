@@ -261,6 +261,7 @@ async function handleTranscribe(req: Request): Promise<Response> {
 
   const workerReq: Record<string, unknown> = {
     audio: wavPath,
+    audio_hash: hash,
     samples_dir: body.samples_dir ?? SAMPLES_DIR,
     cache_dir: body.cache_dir ?? CACHE_DIR,
   };
@@ -304,6 +305,7 @@ async function handleUpload(req: Request): Promise<Response> {
 
   const workerReq: Record<string, unknown> = {
     audio: wavPath,
+    audio_hash: hash,
     samples_dir: SAMPLES_DIR,
     cache_dir: CACHE_DIR,
   };
@@ -311,16 +313,22 @@ async function handleUpload(req: Request): Promise<Response> {
   const cacheDir = form.get("cache_dir");
   if (typeof cacheDir === "string") workerReq.cache_dir = cacheDir;
 
+  const identify = form.get("identify");
+  if (identify === "true" || identify === "1") workerReq.identify = true;
+
   return runWorker(workerReq, hash);
 }
 
 async function runWorker(workerReq: Record<string, unknown>, hash: string): Promise<Response> {
-  // Full transcript cache — skip worker entirely on hit
-  const cached = await readTranscriptCache(hash);
-  if (cached) {
-    cached.transcript_source = "cache";
-    console.log(`[transcript] cache hit for ${hash.slice(0, 16)}…`);
-    return new Response(JSON.stringify(cached), { status: 200, headers: { "content-type": "application/json" } });
+  // Full transcript cache — skip worker entirely on hit (not for identify: clips must be regenerated if missing)
+  const isIdentify = workerReq.identify === true;
+  if (!isIdentify) {
+    const cached = await readTranscriptCache(hash);
+    if (cached) {
+      cached.transcript_source = "cache";
+      console.log(`[transcript] cache hit for ${hash.slice(0, 16)}…`);
+      return new Response(JSON.stringify(cached), { status: 200, headers: { "content-type": "application/json" } });
+    }
   }
 
   let result: { json: string; transcript: string[] };
@@ -373,14 +381,57 @@ const server = Bun.serve({
       return handleTranscribe(req);
     }
 
+    // GET /speakers/:hash/:id  — download a speaker clip WAV
+    const speakerMatch = url.pathname.match(/^\/speakers\/([0-9a-f]{64})\/(\d+)$/);
+    if (speakerMatch && req.method === "GET") {
+      const [, hash, id] = speakerMatch;
+      const clipPath = join(SAMPLES_DIR, hash, `speaker_${id}.wav`);
+      const file = Bun.file(clipPath);
+      if (!(await file.exists())) {
+        return new Response(
+          JSON.stringify({ status: "error", error: `Speaker clip not found. Run POST /transcribe with identify=true first.` }),
+          { status: 404, headers: { "content-type": "application/json" } }
+        );
+      }
+      return new Response(file, {
+        headers: {
+          "content-type": "audio/wav",
+          "content-disposition": `attachment; filename="speaker_${id}.wav"`,
+        },
+      });
+    }
+
+    // GET /speakers/:hash  — list available clips for an audio file
+    const speakerListMatch = url.pathname.match(/^\/speakers\/([0-9a-f]{64})$/);
+    if (speakerListMatch && req.method === "GET") {
+      const [, hash] = speakerListMatch;
+      const clipDir = join(SAMPLES_DIR, hash);
+      try {
+        const fs = await import("fs/promises");
+        const files = await fs.readdir(clipDir);
+        const clips = files
+          .filter(f => f.match(/^speaker_\d+\.wav$/))
+          .map(f => {
+            const id = f.match(/(\d+)/)?.[1];
+            return { id: Number(id), url: `/speakers/${hash}/${id}`, file: f };
+          })
+          .sort((a, b) => a.id - b.id);
+        return new Response(JSON.stringify({ hash, clips }), { headers: { "content-type": "application/json" } });
+      } catch {
+        return new Response(
+          JSON.stringify({ status: "error", error: `No speaker clips found for this audio. Run POST /transcribe with identify=true first.` }),
+          { status: 404, headers: { "content-type": "application/json" } }
+        );
+      }
+    }
+
     return new Response(
       JSON.stringify({
         endpoints: {
           "GET /health": "Worker health check",
-          "POST /transcribe": [
-            "JSON body: { audio: '/abs/path/to/any/audio', cache_dir?, samples_dir?, speakers?, output?, identify? }",
-            "Multipart: 'audio' file field — any format ffmpeg understands",
-          ],
+          "POST /transcribe": "JSON body: { audio, cache_dir?, samples_dir?, speakers?, output?, identify? } or multipart with 'audio' file",
+          "GET /speakers/:hash": "List speaker clips for an audio file (requires prior identify=true run)",
+          "GET /speakers/:hash/:id": "Download speaker WAV clip",
         },
       }),
       { status: 404, headers: { "content-type": "application/json" } }

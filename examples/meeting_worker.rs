@@ -75,6 +75,7 @@ impl From<&CachedSegment> for SpeakerSegment {
 #[derive(serde::Deserialize, Default)]
 struct Request {
     audio: Option<String>,
+    audio_hash: Option<String>,
     speakers: Option<String>,
     output: Option<String>,
     samples_dir: Option<String>,
@@ -91,6 +92,7 @@ struct Response {
     #[serde(skip_serializing_if = "Option::is_none")] elapsed_s: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")] diar_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] speakers: Option<Vec<usize>>,
+    #[serde(skip_serializing_if = "Option::is_none")] speaker_clips: Option<HashMap<usize, String>>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -208,9 +210,12 @@ type ThreadResult<T> = std::result::Result<T, String>;
 
 #[cfg(feature = "sortformer")]
 impl Worker {
-    fn process(&mut self, req: &Request) -> Result<(f32, String, Vec<usize>), Box<dyn std::error::Error>> {
+    fn process(&mut self, req: &Request) -> Result<(f32, String, Vec<usize>, Option<HashMap<usize, String>>), Box<dyn std::error::Error>> {
         let req_start = Instant::now();
         let audio_path = req.audio.as_deref().unwrap();
+        let audio_hash = req.audio_hash.as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| file_hash(audio_path).unwrap_or_else(|_| format!("{}", req_start.elapsed().as_nanos())));
         let samples_dir = req.samples_dir.as_deref().unwrap_or("./speaker_samples");
         let cache_dir_owned: Option<String> = req.cache_dir.clone()
             .or_else(|| self.global_cache_dir.clone());
@@ -233,7 +238,8 @@ impl Worker {
                     let json = std::fs::read_to_string(&cache_path)?;
                     let cached: Vec<CachedSegment> = serde_json::from_str(&json)?;
                     let segs: Vec<SpeakerSegment> = cached.iter().map(|s| s.into()).collect();
-                    return Ok(self.do_identify(&audio, &segs, samples_dir, req.speakers.as_deref(), req_start));
+                    let (e, src, spks, clips) = self.do_identify(&audio, &segs, samples_dir, &audio_hash, req.speakers.as_deref(), req_start);
+                    return Ok((e, src, spks, clips));
                 }
                 let json = std::fs::read_to_string(&cache_path)?;
                 let cached: Vec<CachedSegment> = serde_json::from_str(&json)?;
@@ -248,7 +254,8 @@ impl Worker {
         } else {
             if identify {
                 let (segs, _) = self.run_parallel(&audio, None, None)?;
-                return Ok(self.do_identify(&audio, &segs, samples_dir, req.speakers.as_deref(), req_start));
+                let (e, src, spks, clips) = self.do_identify(&audio, &segs, samples_dir, &audio_hash, req.speakers.as_deref(), req_start);
+                return Ok((e, src, spks, clips));
             }
             let (segs, sents) = self.run_parallel(&audio, None, None)?;
             (segs, sents, "live".to_string())
@@ -276,7 +283,7 @@ impl Worker {
         print_transcript(&merged, &speaker_names, audio_path);
         if let Some(out) = req.output.as_deref() { write_transcript(&merged, &speaker_names, out)?; }
 
-        Ok((req_start.elapsed().as_secs_f32(), diar_source, unique_speakers))
+        Ok((req_start.elapsed().as_secs_f32(), diar_source, unique_speakers, None))
     }
 
     /// Run diarization + TDT in parallel threads (move models out, get them back).
@@ -353,8 +360,8 @@ impl Worker {
 
     fn do_identify(
         &mut self, audio: &[f32], segs: &[SpeakerSegment],
-        samples_dir: &str, speakers_file: Option<&str>, start: Instant,
-    ) -> (f32, String, Vec<usize>) {
+        samples_dir: &str, audio_hash: &str, speakers_file: Option<&str>, start: Instant,
+    ) -> (f32, String, Vec<usize>, Option<HashMap<usize, String>>) {
         let mut speaker_names: HashMap<usize, String> = HashMap::new();
         if let Some(sf) = speakers_file {
             if let Ok(json) = std::fs::read_to_string(sf) {
@@ -365,6 +372,10 @@ impl Worker {
         }
         let mut unique: Vec<usize> = { let mut ids: Vec<usize> = segs.iter().map(|s| s.speaker_id).collect(); ids.sort_unstable(); ids.dedup(); ids };
         unique.sort_unstable();
+        // Scope clips under <samples_dir>/<audio_hash>/ so different files don't overwrite each other
+        let clip_dir = PathBuf::from(samples_dir).join(audio_hash);
+        let _ = std::fs::create_dir_all(&clip_dir);
+        let mut clips: HashMap<usize, String> = HashMap::new();
         for &spk in &unique {
             let name = speaker_names.get(&spk).cloned().unwrap_or_else(|| format!("Speaker {}", spk));
             if let Some(best) = segs.iter().filter(|s| s.speaker_id == spk).max_by_key(|s| s.end - s.start) {
@@ -373,12 +384,13 @@ impl Worker {
                 let len = s_e - s_s;
                 if len < MIN_SPEAKER_SAMPLE_SECS { continue; }
                 let end_s = (s_s + SPEAKER_SAMPLE_SECS).min(s_e);
-                let p = PathBuf::from(samples_dir).join(format!("speaker_{}.wav", spk));
+                let p = clip_dir.join(format!("speaker_{}.wav", spk));
                 let _ = save_sample(audio, best.start as usize, (end_s * 16_000.0) as usize, &p);
                 println!("  Speaker {} ({}): [{} – {}] → {}", spk, name, format_time(s_s), format_time(end_s), p.display());
+                clips.insert(spk, p.to_string_lossy().into_owned());
             }
         }
-        (start.elapsed().as_secs_f32(), "live".to_string(), unique)
+        (start.elapsed().as_secs_f32(), "live".to_string(), unique, Some(clips))
     }
 }
 
@@ -511,7 +523,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = Response { status: "error".into(), error: Some(format!("JSON: {}", e)),
-                        elapsed_s: None, diar_source: None, speakers: None };
+                        elapsed_s: None, diar_source: None, speakers: None, speaker_clips: None };
                     println!("{}", serde_json::to_string(&resp)?);
                     std::io::stdout().flush()?;
                     continue;
@@ -522,23 +534,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if req.audio.is_none() {
                 let resp = Response { status: "error".into(), error: Some("Missing 'audio'".into()),
-                    elapsed_s: None, diar_source: None, speakers: None };
+                    elapsed_s: None, diar_source: None, speakers: None, speaker_clips: None };
                 println!("{}", serde_json::to_string(&resp)?);
                 std::io::stdout().flush()?;
                 continue;
             }
 
             match worker.process(&req) {
-                Ok((elapsed, diar_src, speakers)) => {
+                Ok((elapsed, diar_src, speakers, clips)) => {
                     eprintln!("[worker] ✓ Done in {:.1}s (diar: {})", elapsed, diar_src);
                     let resp = Response { status: "ok".into(), error: None,
-                        elapsed_s: Some(elapsed), diar_source: Some(diar_src), speakers: Some(speakers) };
+                        elapsed_s: Some(elapsed), diar_source: Some(diar_src),
+                        speakers: Some(speakers), speaker_clips: clips };
                     println!("{}", serde_json::to_string(&resp)?);
                 }
                 Err(e) => {
                     eprintln!("[worker] Error: {}", e);
                     let resp = Response { status: "error".into(), error: Some(e.to_string()),
-                        elapsed_s: None, diar_source: None, speakers: None };
+                        elapsed_s: None, diar_source: None, speakers: None, speaker_clips: None };
                     println!("{}", serde_json::to_string(&resp)?);
                 }
             }
