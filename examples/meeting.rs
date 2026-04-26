@@ -246,15 +246,15 @@ fn build_exec_config(use_cuda: bool) -> ExecutionConfig {
     if use_cuda {
         println!("    WARNING: --cuda passed but binary was not built with cuda feature; falling back to CPU");
     }
-    let total = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    ExecutionConfig::new().with_intra_threads(total)
+    // intra=4 for TDT (large MatMuls benefit from parallel cores)
+    // inter=0 tells ORT to auto-select inter-op thread count (matches Python default)
+    ExecutionConfig::new().with_intra_threads(4).with_inter_threads(0)
 }
 
 #[cfg(feature = "sortformer")]
 fn build_sortformer_config() -> ExecutionConfig {
-    // Sortformer runs sequential chunk-by-chunk; 2 threads per chunk is enough
-    // and leaves more cores for the parallel TDT thread.
-    ExecutionConfig::new().with_intra_threads(2)
+    // intra=2 leaves cores for TDT; inter=0 lets ORT auto-parallelize across ops
+    ExecutionConfig::new().with_intra_threads(2).with_inter_threads(0)
 }
 
 /// Write the full transcript to a text file.
