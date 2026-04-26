@@ -377,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let gpu_mode = tdt_on_gpu;
             sortformer.chunk_len = if gpu_mode { 80 } else { 31 };
             sortformer.fifo_len = sortformer.chunk_len;
-            sortformer.spkcache_len = if gpu_mode { 120 } else { 47 };
+            sortformer.spkcache_len = if gpu_mode { 40 } else { 47 };
             let chunk_len = sortformer.chunk_len;
             let right_context = sortformer.right_context;
             let latency = sortformer.latency();
