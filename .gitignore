@@ -14,3 +14,5 @@ DS_Store
 *.model.lab/
 run.log
 .lab/
+rust_out.exe
+rust_out.pdb
