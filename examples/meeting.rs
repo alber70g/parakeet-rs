@@ -246,15 +246,19 @@ fn build_exec_config(use_cuda: bool) -> ExecutionConfig {
     if use_cuda {
         println!("    WARNING: --cuda passed but binary was not built with cuda feature; falling back to CPU");
     }
-    // intra=4 for TDT (large MatMuls benefit from parallel cores)
-    // inter=0 tells ORT to auto-select inter-op thread count (matches Python default)
     ExecutionConfig::new().with_intra_threads(4).with_inter_threads(0)
 }
 
 #[cfg(feature = "sortformer")]
-fn build_sortformer_config() -> ExecutionConfig {
-    // intra=2 leaves cores for TDT; inter=0 lets ORT auto-parallelize across ops
-    ExecutionConfig::new().with_intra_threads(2).with_inter_threads(0)
+fn build_sortformer_config(tdt_on_gpu: bool) -> ExecutionConfig {
+    // When TDT is on GPU, all CPU cores are free for Sortformer.
+    // When TDT is on CPU, limit Sortformer to 2 threads to avoid contention.
+    let threads = if tdt_on_gpu {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    } else {
+        2
+    };
+    ExecutionConfig::new().with_intra_threads(threads).with_inter_threads(0)
 }
 
 /// Write the full transcript to a text file.
@@ -346,8 +350,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let audio_for_tdt = audio.clone();
         let sortformer_model = args.sortformer_model.clone();
         let tdt_dir = args.tdt_dir.clone();
-        let use_cuda_diar = args.use_cuda;
         let use_cuda_tdt = args.use_cuda;
+        let tdt_on_gpu = {
+            #[cfg(feature = "cuda")] { args.use_cuda }
+            #[cfg(not(feature = "cuda"))] { false }
+        };
         let identify_mode = args.identify_mode;
         drop(exec_config); // rebuilt inside each thread
 
@@ -357,7 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let diar_start = Instant::now();
             let mut sortformer = Sortformer::with_config(
                 &sortformer_model,
-                Some(build_sortformer_config()),
+                Some(build_sortformer_config(tdt_on_gpu)),
                 DiarizationConfig::callhome(),
             ).map_err(|e| e.to_string())?;
             // Reduce streaming params for faster CPU inference.
