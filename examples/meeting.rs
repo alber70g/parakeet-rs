@@ -372,12 +372,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(build_sortformer_config(tdt_on_gpu)),
                 DiarizationConfig::callhome(),
             ).map_err(|e| e.to_string())?;
-            // Reduce streaming params for faster CPU inference.
-            // chunk_len=31 is the sweet spot: 12.7s for 336s audio (vs 21s at 62).
-            // Dynamic ONNX axes mean these are valid at runtime.
-            sortformer.chunk_len = 31;
-            sortformer.fifo_len = 31;
-            sortformer.spkcache_len = 47;
+            // GPU: chunk_len=80 is the sweet spot (fewer kernel launches outweigh larger attention).
+            // CPU: chunk_len=31 is faster (smaller chunks reduce per-call CPU work).
+            let gpu_mode = tdt_on_gpu;
+            sortformer.chunk_len = if gpu_mode { 80 } else { 31 };
+            sortformer.fifo_len = sortformer.chunk_len;
+            sortformer.spkcache_len = if gpu_mode { 120 } else { 47 };
             let chunk_len = sortformer.chunk_len;
             let right_context = sortformer.right_context;
             let latency = sortformer.latency();
