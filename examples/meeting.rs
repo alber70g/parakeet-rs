@@ -381,6 +381,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((segs, elapsed, chunk_len, right_context, latency))
         });
 
+        // In GPU mode, let Sortformer load first (Sortformer model load is ~1s, TDT CUDA
+        // init is ~3s of CPU-heavy work). A 1s head start means TDT GPU init runs while
+        // Sortformer is already doing inference, not competing for load-time CPU.
+        if tdt_on_gpu {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
         // In identify mode we only need diarization — skip TDT entirely.
         let tdt_handle = if !identify_mode {
             Some(std::thread::spawn(move || -> ThreadResult<_> {
