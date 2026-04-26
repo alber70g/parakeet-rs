@@ -300,7 +300,7 @@ Optional JSON fields: `cache_dir`, `samples_dir`, `speakers` (path to speakers.j
   "transcript": "[00:00 – 00:04] Speaker 0:\n  Hello everyone.\n..."
 }
 ```
-On a full cache hit `transcript_source` is `"cache"` and the response is returned in ~100ms regardless of audio length.
+On a full cache hit `transcript_source` is `"cache"` and the response returns in ~100ms regardless of audio length.
 
 **Three-layer cache** (all keyed by SHA-256 of the audio content):
 
@@ -310,20 +310,41 @@ On a full cache hit `transcript_source` is `"cache"` and the response is returne
 | Diarization | `.diar_cache/<meta-hash>.diar.json` | Sortformer inference (~4–20s) |
 | Full transcript | `.diar_cache/transcript/<hash>.json` | Everything — TDT + merge |
 
+**Speaker endpoints:**
+
+`GET /speakers/:hash` — list clips for an audio file:
+```bash
+curl http://localhost:3000/speakers/<hash>
+# {"hash":"6c46...","clips":[{"id":0,"url":"/speakers/<hash>/0","file":"speaker_0.wav"},...]}`
+```
+
+`GET /speakers/:hash/:id` — download a speaker clip (5s WAV):
+```bash
+curl -o speaker_0.wav http://localhost:3000/speakers/<hash>/0
+```
+
+Clips are scoped per audio file under `speaker_samples/<hash>/speaker_N.wav` so different meetings never overwrite each other. The hash comes from the `POST /transcribe` response or the `/speakers/:hash` listing.
+
 **Speaker identification flow:**
 ```bash
-# Step 1 — extract speaker audio clips
+# Step 1 — extract speaker clips (bypasses transcript cache to regenerate clips)
 curl -X POST http://localhost:3000/transcribe \
   -F "audio=@meeting.mp3" \
   -F "identify=true"
-# Saves speaker_samples/speaker_0.wav, speaker_1.wav, etc.
+# Response includes "speaker_clips": {"0": "...speaker_0.wav", "1": "...", ...}
+# and the hash needed for the /speakers endpoints
 
-# Step 2 — listen to clips and fill in names
+# Step 2 — list and download clips to identify each speaker
+HASH="<hash from response>"
+curl http://localhost:3000/speakers/$HASH
+curl -o alice.wav http://localhost:3000/speakers/$HASH/0
+curl -o bob.wav   http://localhost:3000/speakers/$HASH/1
+
+# Step 3 — fill in names and re-transcribe (instant from cache)
 cat > speakers.json << 'EOF'
 {"0": "Alice", "1": "Bob", "2": "Carol", "3": "Dave"}
 EOF
 
-# Step 3 — re-run with names (instant if already cached)
 curl -X POST http://localhost:3000/transcribe \
   -H "Content-Type: application/json" \
   -d '{"audio":"/abs/path/meeting.mp3","speakers":"speakers.json"}'
