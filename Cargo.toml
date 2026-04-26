@@ -47,6 +47,11 @@ name = "meeting"
 path = "examples/meeting.rs"
 required-features = ["sortformer"]
 
+[[example]]
+name = "meeting_worker"
+path = "examples/meeting_worker.rs"
+required-features = ["sortformer"]
+
 [dependencies]
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24"] }
 hound = "3.5"
