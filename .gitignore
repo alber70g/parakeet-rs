@@ -1,18 +1,58 @@
+# Rust build
 /target
-DS_Store
+
+# OS
+.DS_Store
 *.DS_Store
+Thumbs.db
+
+# Editors
 .idea
 .vscode
+*.swp
+*.swo
+
+# Logs
 *.log
-*.onnx
-*.json
-*.onnx_data
-*.wav
-*.txt
-*.onnx.data
-*.onnx_data_*
-*.model.lab/
 run.log
+
+# Model files (downloaded separately)
+*.onnx
+*.onnx_data
+*.onnx_data_*
+*.onnx.data
+*.model
+
+# Audio files
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+
+# Transcript / output text
+*.txt
+
+# Speaker / config JSON (kept locally, not part of source)
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+
+# Diarization + transcript cache
+.diar_cache/
+
+# Speaker sample clips
+speaker_samples/
+
+# Research lab
 .lab/
+.lab.bak*/
+
+# Bun
+server/node_modules/
+server/bun.lockb
+
+# Compiled binaries left in root
 rust_out.exe
 rust_out.pdb

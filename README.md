@@ -183,10 +183,183 @@ let config = ExecutionConfig::new()
 - [Sortformer v2 & v2.1: Streaming speaker diarization (up to 4 speakers)](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) NOTE: you can also download v2.1 model same way.
 - Token-level timestamps (CTC, TDT)
 
+## Meeting Pipeline (Diarization + Transcription)
+
+`examples/meeting.rs` and `examples/meeting_worker.rs` combine Sortformer diarization with TDT transcription into a full meeting pipeline. Both run diarization and transcription in parallel on GPU.
+
+**Benchmarks** (RTX 2070 Super, CUDA EP, ORT 1.25):
+
+| Audio | Mode | Time | % of duration |
+|-------|------|------|---------------|
+| 5m 36s | standalone cold start | 6.4s | 1.9% |
+| 5m 36s | worker — first run | 4.0s | 1.2% |
+| 5m 36s | worker — cached diar | 2.4s | 0.7% |
+| 39m 41s | standalone cold start | 24.2s | 1.0% |
+| 39m 41s | worker — first run | 22.2s | 0.9% |
+| 39m 41s | worker — cached diar | 17.2s | 0.7% |
+
+### Standalone (`examples/meeting.rs`)
+
+Loads models fresh each run. Best for one-off transcriptions.
+
+```bash
+cargo build --release --example meeting --features "sortformer load-dynamic cuda"
+
+# Run (audio must be 16kHz mono WAV)
+ORT_DYLIB_PATH="/path/to/onnxruntime.dll" \
+./target/release/examples/meeting path/to/recording.wav \
+  --samples-dir ./speaker_samples --cuda
+```
+
+Output: timestamped transcript with speaker labels. On first run use `--identify` to extract per-speaker audio clips, then fill in `speakers.json` to get named output on subsequent runs.
+
+### Worker (`examples/meeting_worker.rs`)
+
+Persistent daemon that loads both models once (~5.5s) and keeps them in GPU memory. Amortizes model load across all requests. Repeat runs of the same file skip diarization entirely (cache hit).
+
+```bash
+cargo build --release --example meeting_worker --features "sortformer load-dynamic cuda"
+
+# Start daemon
+./target/release/examples/meeting_worker.exe --cuda --cache-dir .diar_cache
+
+# Send requests as JSON lines on stdin:
+{"audio":"recording.wav","samples_dir":"./speaker_samples","cache_dir":".diar_cache"}
+
+# Quit:
+{"quit":true}
+```
+
+Response JSON:
+```json
+{"status":"ok","elapsed_s":2.37,"diar_source":"cache","speakers":[0,1,2,3]}
+```
+
+**Diarization cache**: results are stored as `<cache_dir>/<metadata-hash>.diar.json`. The cache key is derived from the file's mtime + size (no content read needed). Speaker audio clips are saved as `<cache_dir>/speakers/<hash>_<spk_id>.emb` (raw f32, 5s per speaker) for cross-file identity transfer.
+
+**GPU-optimal parameters** (tuned empirically):
+- `chunk_len=80, fifo_len=80` — fewer ONNX kernel launches vs smaller chunks
+- `spkcache_len=40` — quality floor; below 30 misses speakers in long 4-speaker meetings
+- No CUDA stagger between diar+TDT threads — JIT already done at model load
+
+### Web Service (`server/`)
+
+Bun.js + TypeScript HTTP server wrapping the worker. Accepts **any audio format ffmpeg understands** — MP3, M4A, OGG, FLAC, WAV, etc. Handles conversion, caching, and worker IPC automatically.
+
+**Setup:**
+```bash
+cd server && bun install
+```
+
+**Start (from project root):**
+```bash
+export ORT_DYLIB_PATH="/c/Python312/Lib/site-packages/onnxruntime/capi/onnxruntime.dll"
+export PATH="/c/Users/$USER/AppData/Local/uv/cache/archive-v0/<hash>/torch/lib:$PATH"
+
+bun run server/index.ts
+# [server] listening on http://localhost:3000
+# [worker] ready (load=5.5s)
+```
+
+**Endpoints:**
+
+`GET /health`
+```bash
+curl http://localhost:3000/health
+# {"status":"ok","worker":"...meeting_worker.exe"}
+```
+
+`POST /transcribe` — file upload (any format):
+```bash
+# MP3, M4A, OGG, FLAC — anything ffmpeg reads
+curl -X POST http://localhost:3000/transcribe \
+  -F "audio=@meeting.mp3"
+
+# Second request for the same file: ~100ms (full cache hit)
+curl -X POST http://localhost:3000/transcribe \
+  -F "audio=@meeting.mp3"
+```
+
+`POST /transcribe` — JSON body with local file path:
+```bash
+curl -X POST http://localhost:3000/transcribe \
+  -H "Content-Type: application/json" \
+  -d '{"audio": "/abs/path/to/meeting.mp3"}'
+```
+
+Optional JSON fields: `cache_dir`, `samples_dir`, `speakers` (path to speakers.json), `output` (save transcript to file), `identify` (extract speaker clips).
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "elapsed_s": 17.1,
+  "diar_source": "cache",
+  "transcript_source": "live",
+  "speakers": [0, 1, 2, 3],
+  "transcript": "[00:00 – 00:04] Speaker 0:\n  Hello everyone.\n..."
+}
+```
+On a full cache hit `transcript_source` is `"cache"` and the response is returned in ~100ms regardless of audio length.
+
+**Three-layer cache** (all keyed by SHA-256 of the audio content):
+
+| Layer | Path | Saves |
+|-------|------|-------|
+| WAV conversion | `.diar_cache/wav/<hash>.wav` | ffmpeg re-conversion |
+| Diarization | `.diar_cache/<meta-hash>.diar.json` | Sortformer inference (~4–20s) |
+| Full transcript | `.diar_cache/transcript/<hash>.json` | Everything — TDT + merge |
+
+**Speaker identification flow:**
+```bash
+# Step 1 — extract speaker audio clips
+curl -X POST http://localhost:3000/transcribe \
+  -F "audio=@meeting.mp3" \
+  -F "identify=true"
+# Saves speaker_samples/speaker_0.wav, speaker_1.wav, etc.
+
+# Step 2 — listen to clips and fill in names
+cat > speakers.json << 'EOF'
+{"0": "Alice", "1": "Bob", "2": "Carol", "3": "Dave"}
+EOF
+
+# Step 3 — re-run with names (instant if already cached)
+curl -X POST http://localhost:3000/transcribe \
+  -H "Content-Type: application/json" \
+  -d '{"audio":"/abs/path/meeting.mp3","speakers":"speakers.json"}'
+```
+
+**Environment variables** (all have defaults):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PORT` | `3000` | HTTP port |
+| `WORKER_EXE` | `target/release/examples/meeting_worker.exe` | Worker binary path |
+| `CACHE_DIR` | `.diar_cache` | Root cache directory |
+| `SAMPLES_DIR` | `speaker_samples` | Speaker clip output directory |
+| `FFMPEG` | `ffmpeg` | ffmpeg binary path |
+| `NO_CUDA` | unset | Set to `1` to disable CUDA |
+| `WORKER_TIMEOUT_MS` | `300000` | Per-request timeout (ms) |
+| `ORT_DYLIB_PATH` | Python onnxruntime-gpu DLL | Path to ORT shared library |
+| `CUDA_LIBS` | PyTorch uv cache torch/lib | Directory containing cuDNN/cuBLAS DLLs |
+
+### CUDA Setup (Windows)
+
+CUDA EP requires ORT 1.25 from the Python `onnxruntime-gpu` package and cuDNN 9 + cuBLAS 12 from the PyTorch uv cache:
+
+```bash
+export ORT_DYLIB_PATH="/c/Python312/Lib/site-packages/onnxruntime/capi/onnxruntime.dll"
+export PATH="/c/Users/$USER/AppData/Local/uv/cache/archive-v0/<hash>/torch/lib:$PATH"
+
+cargo build --release --example meeting --features "sortformer load-dynamic cuda"
+```
+
+ORT 1.19 does **not** work with CUDA EP for dynamic-shape Sortformer graphs — use ORT 1.25 via the Python package.
+
 ## Notes
 
-- Audio: 16kHz mono WAV (16-bit PCM or 32-bit float)
-- CTC/TDT models have ~4-5 minute audio length limit. For longer files, use streaming models or split into chunks
+- Audio: 16kHz mono WAV (16-bit PCM or 32-bit float) for the Rust API and standalone/worker examples. The web service accepts any format and converts automatically via ffmpeg.
+- CTC/TDT models have ~4-5 minute audio length limit. For longer files, use streaming models or split into chunks.
 
 ## License
 
