@@ -114,13 +114,16 @@ fn to_mono(audio: Vec<f32>, channels: u16) -> Vec<f32> {
     audio.chunks(channels as usize).map(|c| c.iter().sum::<f32>() / channels as f32).collect()
 }
 
-/// FNV-1a 64-bit hash of file bytes — fast cache key for WAV files.
+/// Cache key from file metadata (mtime + size). Fast: no file read needed.
+/// Reliable for meeting WAV files which don't get silently mutated.
 #[cfg(feature = "sortformer")]
 fn file_hash(path: &str) -> std::io::Result<String> {
-    let data = std::fs::read(path)?;
-    let mut h: u64 = 14695981039346656037;
-    for &b in &data { h ^= b as u64; h = h.wrapping_mul(1099511628211); }
-    Ok(format!("{:016x}", h))
+    let meta = std::fs::metadata(path)?;
+    let size = meta.len();
+    let mtime = meta.modified()
+        .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0))
+        .unwrap_or(0);
+    Ok(format!("{:016x}{:032x}", size, mtime))
 }
 
 #[cfg(feature = "sortformer")]
