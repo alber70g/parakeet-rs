@@ -75,9 +75,9 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "sortformer")]
 use std::time::Instant;
 
-// TDT sequence length limit: 5 minutes of audio at 16kHz
+// TDT chunk size: 30s is optimal (quadratic attention scaling makes 5-min chunks ~8x slower)
 #[cfg(feature = "sortformer")]
-const TDT_CHUNK_SAMPLES: usize = 16_000 * 60 * 5;
+const TDT_CHUNK_SAMPLES: usize = 16_000 * 30;
 // Minimum audio samples needed to identify a speaker (1 second)
 #[cfg(feature = "sortformer")]
 const MIN_SPEAKER_SAMPLE_SECS: f32 = 1.0;
@@ -231,7 +231,9 @@ fn save_speaker_sample(
     Ok(())
 }
 
-/// Build execution config — CUDA if requested and feature is enabled, else CPU.
+/// Build execution config for a given role.
+/// `tdt`: uses more threads (TDT encoder has large parallel matmuls).
+/// Sortformer is sequential across chunks — fewer threads reduce contention.
 #[cfg(feature = "sortformer")]
 fn build_exec_config(use_cuda: bool) -> ExecutionConfig {
     #[cfg(feature = "cuda")]
@@ -244,9 +246,15 @@ fn build_exec_config(use_cuda: bool) -> ExecutionConfig {
     if use_cuda {
         println!("    WARNING: --cuda passed but binary was not built with cuda feature; falling back to CPU");
     }
-    // For CPU: use all available threads for ONNX intra-op parallelism
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    ExecutionConfig::new().with_intra_threads(threads)
+    let total = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    ExecutionConfig::new().with_intra_threads(total)
+}
+
+#[cfg(feature = "sortformer")]
+fn build_sortformer_config() -> ExecutionConfig {
+    // Sortformer runs sequential chunk-by-chunk; 2 threads per chunk is enough
+    // and leaves more cores for the parallel TDT thread.
+    ExecutionConfig::new().with_intra_threads(2)
 }
 
 /// Write the full transcript to a text file.
@@ -349,15 +357,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let diar_start = Instant::now();
             let mut sortformer = Sortformer::with_config(
                 &sortformer_model,
-                Some(build_exec_config(use_cuda_diar)),
+                Some(build_sortformer_config()),
                 DiarizationConfig::callhome(),
             ).map_err(|e| e.to_string())?;
-            // Halve the streaming params to reduce attention cost per chunk.
-            // The ONNX graph uses dynamic axes so these are valid at runtime.
-            // Trade-off: slightly lower diarization quality but much faster on CPU.
-            sortformer.chunk_len = 62;
-            sortformer.fifo_len = 62;
-            sortformer.spkcache_len = 94;
+            // Reduce streaming params for faster CPU inference.
+            // chunk_len=31 is the sweet spot: 12.7s for 336s audio (vs 21s at 62).
+            // Dynamic ONNX axes mean these are valid at runtime.
+            sortformer.chunk_len = 31;
+            sortformer.fifo_len = 31;
+            sortformer.spkcache_len = 47;
             let chunk_len = sortformer.chunk_len;
             let right_context = sortformer.right_context;
             let latency = sortformer.latency();
