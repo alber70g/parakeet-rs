@@ -35,6 +35,24 @@ async function bytesHash(buf: ArrayBuffer): Promise<string> {
   return createHash("sha256").update(Buffer.from(buf)).digest("hex");
 }
 
+function namesPath(hash: string): string {
+  return join(SAMPLES_DIR, hash, "names.json");
+}
+
+async function readNames(hash: string): Promise<Record<string, string> | null> {
+  try {
+    const text = await Bun.file(namesPath(hash)).text();
+    return JSON.parse(text) as Record<string, string>;
+  } catch {
+    return null;
+  }
+}
+
+async function writeNames(hash: string, names: Record<string, string>): Promise<void> {
+  await mkdir(join(SAMPLES_DIR, hash), { recursive: true });
+  await Bun.write(namesPath(hash), JSON.stringify(names, null, 2));
+}
+
 async function readTranscriptCache(hash: string): Promise<Record<string, unknown> | null> {
   const path = join(TRANSCRIPT_CACHE_DIR, `${hash}.json`);
   try {
@@ -330,7 +348,19 @@ async function handleUpload(req: Request): Promise<Response> {
 
 async function runWorker(workerReq: Record<string, unknown>, hash: string): Promise<Response> {
   const isIdentify = workerReq.identify === true;
-  const hasSpeakers = typeof workerReq.speakers === "string";
+  let hasSpeakers = typeof workerReq.speakers === "string";
+
+  // Auto-inject saved names when caller didn't supply their own speakers file
+  if (!isIdentify && !hasSpeakers) {
+    const savedNames = await readNames(hash);
+    if (savedNames) {
+      const tmpPath = join(SAMPLES_DIR, hash, "names_tmp.json");
+      await Bun.write(tmpPath, JSON.stringify(savedNames));
+      workerReq.speakers = tmpPath;
+      hasSpeakers = true;
+      console.log(`[names] auto-injecting saved names for ${hash.slice(0, 16)}…`);
+    }
+  }
 
   // Transcript cache only applies to plain transcription (no identify, no custom speaker names)
   const useCache = !isIdentify && !hasSpeakers;
@@ -338,6 +368,7 @@ async function runWorker(workerReq: Record<string, unknown>, hash: string): Prom
     const cached = await readTranscriptCache(hash);
     if (cached) {
       cached.transcript_source = "cache";
+      cached.audio_hash = hash;
       console.log(`[transcript] cache hit for ${hash.slice(0, 16)}…`);
       return new Response(JSON.stringify(cached), { status: 200, headers: { "content-type": "application/json" } });
     }
@@ -361,6 +392,7 @@ async function runWorker(workerReq: Record<string, unknown>, hash: string): Prom
 
   parsed.transcript = result.transcript.join("\n");
   parsed.transcript_source = "live";
+  parsed.audio_hash = hash;
 
   // Only cache plain anonymous transcripts — named/identify runs are not cached
   if (useCache) {
@@ -415,6 +447,28 @@ const server = Bun.serve({
       });
     }
 
+    // PUT /speakers/:hash/names  — save speaker id→name mapping
+    const speakerNamesMatch = url.pathname.match(/^\/speakers\/([0-9a-f]{64})\/names$/);
+    if (speakerNamesMatch && req.method === "PUT") {
+      const [, hash] = speakerNamesMatch;
+      let names: Record<string, string>;
+      try { names = await req.json() as Record<string, string>; } catch {
+        return jsonError("Invalid JSON body", 400);
+      }
+      if (typeof names !== "object" || Array.isArray(names)) return jsonError("Body must be an object mapping speaker id to name", 400);
+      await writeNames(hash, names);
+      console.log(`[names] saved ${Object.keys(names).length} name(s) for ${hash.slice(0, 16)}…`);
+      return new Response(JSON.stringify({ status: "ok", hash, names }), { headers: { "content-type": "application/json" } });
+    }
+
+    // GET /speakers/:hash/names  — read saved names
+    if (speakerNamesMatch && req.method === "GET") {
+      const [, hash] = speakerNamesMatch;
+      const names = await readNames(hash);
+      if (!names) return new Response(JSON.stringify({ status: "error", error: "No names saved for this audio" }), { status: 404, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ hash, names }), { headers: { "content-type": "application/json" } });
+    }
+
     // GET /speakers/:hash  — list available clips for an audio file
     const speakerListMatch = url.pathname.match(/^\/speakers\/([0-9a-f]{64})$/);
     if (speakerListMatch && req.method === "GET") {
@@ -446,6 +500,8 @@ const server = Bun.serve({
           "POST /transcribe": "JSON body: { audio, cache_dir?, samples_dir?, speakers?, output?, identify? } or multipart with 'audio' file",
           "GET /speakers/:hash": "List speaker clips for an audio file (requires prior identify=true run)",
           "GET /speakers/:hash/:id": "Download speaker WAV clip",
+          "PUT /speakers/:hash/names": "Save speaker names: body {\"0\":\"Alice\",\"1\":\"Bob\"} — auto-applied on future transcriptions",
+          "GET /speakers/:hash/names": "Read saved speaker names for an audio file",
         },
       }),
       { status: 404, headers: { "content-type": "application/json" } }

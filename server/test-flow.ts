@@ -42,10 +42,8 @@ console.log({
 console.log("\n--- transcript (first 15 lines) ---");
 resp2.transcript?.split("\n").slice(0, 15).forEach((l: string) => console.log(l));
 
-const HASH: string = resp2.audio_hash ?? (() => {
-  // derive from known value since server doesn't echo it back yet
-  return "6c461802c15d21780af727e9d1065d4436fc4852999905debb69323760ea955e";
-})();
+const HASH: string = resp2.audio_hash;
+if (!HASH) { console.error("No audio_hash in response — server may be outdated"); process.exit(1); }
 
 // ── Step 3: identify — extract speaker clips ──────────────────────────────────
 section("STEP 3: identify speakers — extract 5s clips");
