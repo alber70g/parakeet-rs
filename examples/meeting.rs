@@ -250,10 +250,15 @@ fn build_exec_config(use_cuda: bool) -> ExecutionConfig {
 }
 
 #[cfg(feature = "sortformer")]
-fn build_sortformer_config(tdt_on_gpu: bool) -> ExecutionConfig {
-    // When TDT is on GPU, all CPU cores are free for Sortformer.
-    // When TDT is on CPU, limit Sortformer to 2 threads to avoid contention.
-    let threads = if tdt_on_gpu {
+fn build_sortformer_config(use_gpu: bool) -> ExecutionConfig {
+    #[cfg(feature = "cuda")]
+    if use_gpu {
+        return ExecutionConfig::new()
+            .with_execution_provider(ExecutionProvider::Cuda)
+            .with_intra_threads(1);
+    }
+    // On CPU: when TDT is on GPU, all cores are free; otherwise split with TDT.
+    let threads = if use_gpu {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
     } else {
         2
@@ -381,11 +386,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((segs, elapsed, chunk_len, right_context, latency))
         });
 
-        // In GPU mode, let Sortformer load first (Sortformer model load is ~1s, TDT CUDA
-        // init is ~3s of CPU-heavy work). A 1s head start means TDT GPU init runs while
-        // Sortformer is already doing inference, not competing for load-time CPU.
+        // In GPU mode both models do CUDA JIT init concurrently. Stagger the TDT start
+        // slightly so the two CUDA init passes don't fully collide on the CPU.
         if tdt_on_gpu {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
         // In identify mode we only need diarization — skip TDT entirely.
